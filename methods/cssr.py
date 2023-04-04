@@ -13,6 +13,7 @@ import time
 from torchvision.transforms import transforms
 from methods.resnet import ResNet
 from torchvision import models as torchvision_models
+from methods.cac_utils import *
 
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -184,6 +185,7 @@ class AutoEncoder(nn.Module):
         else:
             self.center = nn.Parameter(torch.rand([inchannel, 1, 1]), True)
 
+    # TODO: Create anchors and use cac based method here
     def forward(self, x):
         if self.latent_size > 0:
             output = x
@@ -199,7 +201,6 @@ class AutoEncoder(nn.Module):
 
 
 class CSSRClassifier(nn.Module):
-    # TODO: Update here for getting latent vector and its average
     def __init__(self, inchannels, num_class, config):
         super().__init__()
         ae_hidden = config['ae_hidden']
@@ -216,7 +217,6 @@ class CSSRClassifier(nn.Module):
         self.reduction = -1 if config['model'] == 'pcssr' else 1
         self.reduction *= config['gamma']
 
-    # TODO: create new method for the new error calcultion based on euclidean distance
     def ae_error(self, rc, x):
         """Calculating the autoencoder reconstruction error.
 
@@ -485,10 +485,11 @@ class CSSRModel(nn.Module):
 
         # ----- New Arch
         x, logits = self.backbone_cs(x, feature_only=reqfeature)
-        # TODO: Append latents during evaluation here.
+        # TODO: reshape the logits. current shape is (128, 6, 8, 8), reshape by changing the output dimension of network
         if reqfeature:
             return x
         x, xcls_raw = x, logits
+        #
 
         def pred_score(xcls):
             def score_reduce(x): return x.reshape(
@@ -517,10 +518,10 @@ class CSSRModel(nn.Module):
             return pred, scores
 
         if self.training:
+            # xcls is the loss value obtained from the CSSRCriterion class
             xcls = self.crt(xcls_raw, ycls)
             if reqpredauc:
                 pred, score = pred_score(xcls_raw.detach())
-                # TODO: Here return the latent vector as well.
                 return xcls, pred, score
         else:
             xcls = xcls_raw
@@ -548,31 +549,87 @@ class CSSRModel(nn.Module):
 class CSSRCriterion(nn.Module):
 
     def get_onehot_label(self, y, clsnum):
+        """create one hot encoded vector
+        1. create the tensor of zeros of shape number of rows in y and clsnum.
+        2. .scatter_(1,y,1) will fills the one hot encoding for each label in y
+        For ex:
+        (1,0,0)
+        (0,1,0)
+        (0,0,1)
+        Args:
+            y (_type_): _description_
+            clsnum (_type_): _description_
+
+        Returns:
+            _type_: _description_
+        """
+        # Reshape y to 1D and then convert to the tensor of integers
         y = torch.reshape(y, [-1, 1]).long()
         return torch.zeros(y.shape[0], clsnum).cuda().scatter_(1, y, 1)
 
-    def __init__(self, avg_order, enable_sigma=True):
+    def __init__(self, avg_order, num_classes, enable_sigma=True):
         super().__init__()
         self.avg_order = {"avg_softmax": 1, "softmax_avg": 2}[avg_order]
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.enable_sigma = enable_sigma
+        self.num_classes = num_classes
+        self.anchors = nn.Parameter(torch.zeros(
+            self.num_classes, self.num_classes).double(), requires_grad=False)
 
+        with open("datasets/config.json") as config_file:
+            self.cfg = json.load(config_file)["CIFAR10"]
+        _, _, _, self.mapping = get_train_loaders(
+            "CIFAR10", 0, self.cfg
+        )
     # TODO: Change in forward method to update the loss function from softmax to CAC distance based loss @ https://github.com/dimitymiller/cac-openset
 
+    def distance_classifier(self, x):
+        ''' Calculates euclidean distance from x to each class anchor
+                Returns n x m array of distance from input of batch_size n to anchors of size m
+        '''
+
+        n = x.size(0)
+        m = self.num_classes
+        d = self.num_classes
+
+        x = x.unsqueeze(1).expand(n, m, d).double()
+        anchors = self.anchors.unsqueeze(0).expand(n, m, d).cuda()
+        dists = torch.norm(x-anchors, 2, 2)
+
+        return dists
+
+    def CACLoss(self, distances, gt):
+        '''Returns CAC loss, as well as the Anchor and Tuplet loss components separately for visualisation.'''
+        true = torch.gather(distances, 1, gt.view(-1, 1)).view(-1).cuda()
+        non_gt = torch.Tensor([[i for i in range(self.num_classes) if gt[x] != i]
+                              for x in range(len(distances))]).long().cuda()
+        others = torch.gather(distances, 1, non_gt)
+
+        anchor = torch.mean(true)
+
+        tuplet = torch.exp(-others+true.unsqueeze(1))
+        tuplet = torch.mean(torch.log(1+torch.sum(tuplet, dim=1)))
+
+        total = 0.1*anchor + tuplet
+
+        return total, anchor, tuplet
+
     def forward(self, x, y=None, prob=False, pred=False):
-        if self.avg_order == 1:
-            g = self.avg_pool(x).view(x.shape[0], -1)
-            g = torch.softmax(g, dim=1)
-        elif self.avg_order == 2:
-            g = torch.softmax(x, dim=1)
-            g = self.avg_pool(g).view(x.size(0), -1)
+
+        g = self.avg_pool(x).view(x.shape[0], -1)
+        g = self.distance_classifier(g)
+
+        if y is not None:
+            targets = torch.Tensor([self.mapping[xi]
+                                   for xi in y]).long().cuda()
+            cacLoss, _, _ = self.CACLoss(g, targets)
+
         if prob:
             return g
         if pred:
             return torch.argmax(g, dim=1)
-        loss = -torch.sum(self.get_onehot_label(y,
-                          g.shape[1]) * torch.log(g), dim=1).mean()
-        return loss
+
+        return cacLoss
 
 
 def manual_contrast(x):
@@ -662,7 +719,15 @@ class CSSRMethod:
         self.batch_size = config['batch_size']
 
         self.clsnum = clssnum
-        self.crt = CSSRCriterion(config['arch_type'], False)
+        self.crt = CSSRCriterion(config['arch_type'], clssnum, False)
+        with open("datasets/config.json") as config_file:
+            cfg = json.load(config_file)["CIFAR10"]
+
+        self.trainloader, self.valloader, _, self.mapping = get_train_loaders(
+            "CIFAR10", 0, cfg
+        )
+        # Here building the whole network. The CSSRModel class contains the build of alll
+        # model with backbone and classifier and loss function
         self.model = CSSRModel(self.clsnum, config, self.crt).cuda()
         self.modelopt = torch.optim.SGD(
             self.model.parameters(), lr=self.lr, weight_decay=5e-4)
@@ -675,6 +740,14 @@ class CSSRMethod:
         self.prepared = -999
 
     def train_epoch(self):
+        global cfg
+        """Trains the model using the dataloader.
+        self.wrap_loader is used as a trainloader here, and this wrap loader wraps the
+        trainloader dataset into a wrapper with various transformations.
+
+        Returns:
+            _type_: _description_
+        """
         data_time = AverageMeter()
         batch_time = AverageMeter()
         train_acc = AverageMeter()
@@ -683,8 +756,12 @@ class CSSRMethod:
 
         self.model.train()
 
+        # TODO: code embedded dataset name just for testing
+        # TODO: remove the name and use from arguments
+
         endtime = time.time()
-        for i, data in enumerate(tqdm.tqdm(self.wrap_loader)):
+        # for i, data in enumerate(tqdm.tqdm(self.wrap_loader)):
+        for i, data in enumerate(self.trainloader):
             data_time.update(time.time() - endtime)
 
             self.lr = self.lr_schedule.get_lr(self.epoch, i, self.lr)
@@ -693,6 +770,8 @@ class CSSRMethod:
 
             loss, pred, scores = self.model(sx, lb, reqpredauc=True)
             self.modelopt.zero_grad()
+            # This back propagation of the loss should be the loss from CAC.
+            # TODO: track thee cac loss from here and use this for backward
             loss.backward()
             self.modelopt.step()
 

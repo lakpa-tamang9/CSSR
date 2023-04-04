@@ -45,7 +45,7 @@
         "error_measure": "L1"
     },
     "cat_weight": 1,
-    "arch_type": "softmax_avg",
+    "arch_type": "avg_softmax",
     "abs_logits": false,
     "aug_sublabel": 1,
     "score": "R[0]",

@@ -125,7 +125,7 @@ def overall_testing():
     global train_loader, test_loader
     global last_acc, last_auroc, last_f1, cwauc, best_acc, best_auroc
 
-    scores, thresh, pred = mth.knownpred_unknwonscore_test(test_loader)
+    scores, thresh, pred = mth.knownpred_unknwonscore_test()
     # euclidean_dist_errs = mth.get_euclidean_distance()
     last_acc = evaluation.close_accuracy(pred)
     indexes = evaluation.open_detection_indexes(scores, thresh)
