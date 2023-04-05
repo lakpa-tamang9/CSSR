@@ -11,7 +11,6 @@ import json
 from torch.autograd import Variable
 import numpy as np
 import random
-
 random.seed(1000)
 
 
