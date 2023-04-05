@@ -11,7 +11,7 @@ from methods import *
 import os
 import sys
 import methods.util as util
-
+from methods.cac_utils import *
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -64,45 +64,14 @@ last_f1 = -1
 cwauc = -1
 
 
-def training_main():
+def training_main(dataset_name, trial):
     tot_epoch = config['epoch_num']
     global best_acc, best_auroc
 
     for epoch in range(mth.epoch, tot_epoch):
         sys.stdout.flush()
-        losses = mth.train_epoch()
-        acc = 0
-        auroc = 0
-        if epoch % 1 == 0:
-            save_everything(f'ckpt{epoch}')
-
-        if epoch % test_interval == test_interval - 1:
-            # big test with aurocs
-            scores, thresh, pred = mth.knownpred_unknwonscore_test(test_loader)
-            acc = evaluation.close_accuracy(pred)
-            open_detection = evaluation.open_detection_indexes(scores, thresh)
-            auroc = open_detection['auroc']
-            log_history(epoch, {
-                "loss": losses,
-                "close acc": acc,
-                "open_detection": open_detection,
-                "open_reco": evaluation.open_reco_indexes(scores, thresh, pred)
-            })
-        else:
-            # close_pred = mth.known_prediction_test(train_labeled_loader,train_unlabeled_loader,test_loader)
-            # acc = evaluation.close_accuracy(close_pred)
-            log_history(epoch, {
-                "loss": losses,
-                # "close acc" : acc,
-            })
-        # if epoch % 10 == 0:
-        save_everything()
-        if acc > best_acc:
-            best_acc = acc
-            save_everything("acc")
-        if auroc > best_auroc:
-            best_auroc = auroc
-            save_everything("auroc")
+        mth.train_epoch(epoch)
+        mth.val(epoch, dataset_name, trial)
 
 
 def get_best_acc_auc():
@@ -119,30 +88,6 @@ def get_best_acc_auc():
         if auc > best_auc[1]:
             best_auc = [epoch, auc]
     return best_acc, best_auc
-
-
-def overall_testing():
-    global train_loader, test_loader
-    global last_acc, last_auroc, last_f1, cwauc, best_acc, best_auroc
-
-    scores, thresh, pred = mth.knownpred_unknwonscore_test()
-    # euclidean_dist_errs = mth.get_euclidean_distance()
-    last_acc = evaluation.close_accuracy(pred)
-    indexes = evaluation.open_detection_indexes(scores, thresh)
-    last_auroc = indexes['auroc']
-    osr_indexes = evaluation.open_reco_indexes(scores, thresh, pred)
-    last_f1 = osr_indexes['macro_f1']
-    log_history(-1, {
-        "close acc": last_acc,
-        "open_detection": indexes,
-        "open_reco": osr_indexes
-    })
-    metrices = {
-        "close acc": last_acc,
-        "open_detection": indexes,
-        "open_reco": osr_indexes}
-    with open("./save/run04/eval.json", "w") as f:
-        json.dump(metrices, f)
 
 
 def update_config_keyvalues(config, update):
@@ -207,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, required=False,
                         default="./configs/pcssr/cifar10.json", help='model configuration, choose from ./configs')
     parser.add_argument('--save', type=str, required=False,
-                        default="run04", help='Saving folder name')
+                        default="cacloss_run02", help='Saving folder name')
     parser.add_argument('--method', type=str, required=False, default="cssr",
                         help='Methods : ' + ",".join(util.method_list.keys()))
     parser.add_argument('--test', action="store_true", help='Evaluation mode')
@@ -215,10 +160,15 @@ if __name__ == "__main__":
                         default="", help='Update several key values in config')
     parser.add_argument('--test_interval', type=int, required=False,
                         default=1, help='The frequency of model evaluation')
-
+    parser.add_argument(
+        '--dataset_name', help="Name of the dataset to be used.")
+    parser.add_argument(
+        '--trial', help="Number of the trial to be used.")
     args = parser.parse_args()
 
     test_interval = args.test_interval
+    args.dataset_name = 'CIFAR10'
+    args.trial = 0
     if not args.save.endswith("/"):
         args.save += "/"
 
@@ -237,19 +187,24 @@ if __name__ == "__main__":
 
     train_loader, test_loader, classnum = dataset.load_partitioned_dataset(
         args, args.ds)
-    mth = util.method_list[args.method](config, classnum, train_loader.dataset)
+
+    with open("datasets/config.json") as config_file:
+        cfg = json.load(config_file)["CIFAR10"]
+
+    trainloader, valloader, _, mapping = get_train_loaders(
+        "CIFAR10", args.trial, cfg
+    )
+
+    mth = util.method_list[args.method](
+        config, classnum, trainloader, valloader, mapping)
 
     history = []
-    evaluation = metrics.OSREvaluation(test_loader)
+    # evaluation = metrics.OSREvaluation(valloader)
 
     # args.test = True
     if not args.test:
         print(f"TotalEpochs:{config['epoch_num']}")
-        training_main()
-        save_everything()
-        overall_testing()
-        print("Overall: LastAcc", last_acc, " LastAuroc", last_auroc,
-              " BestAcc", best_acc, " BestAuroc", best_auroc, "CWAuroc", cwauc)
-    else:
-        load_everything()
-        overall_testing()
+        training_main(args.dataset_name, args.trial)
+
+    # else:
+    #     load_everything()
