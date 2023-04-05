@@ -14,6 +14,8 @@ from torchvision.transforms import transforms
 from methods.resnet import ResNet
 from torchvision import models as torchvision_models
 from methods.cac_utils import *
+from methods.utils import *
+from tensorboardX import SummaryWriter
 
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -481,7 +483,7 @@ class CSSRModel(nn.Module):
             scores[pr] = (gm * avg_gram[pr]).sum(dim=[1, 2]).cpu().numpy()
         return scores.argmax(axis=0)
 
-    def forward(self, x, ycls=None, reqpredauc=False, prepareTest=False, reqfeature=False):
+    def forward(self, x, ycls=None, reqpredauc=False, reqfeature=False):
 
         # ----- New Arch
         x, logits = self.backbone_cs(x, feature_only=reqfeature)
@@ -489,61 +491,12 @@ class CSSRModel(nn.Module):
         if reqfeature:
             return x
         x, xcls_raw = x, logits
-        #
 
-        def pred_score(xcls):
-            def score_reduce(x): return x.reshape(
-                [x.shape[0], -1]).mean(axis=1)
-            x_detach = x.detach()
-            probs = self.crt(xcls, prob=True).cpu().numpy()
-            pred = probs.argmax(axis=1)
-            max_prob = probs.max(axis=1)
+        # xcls is the loss value obtained from the CSSRCriterion class
+        xcls, targets, outlinear, outdistance, (anL, tupL) = self.crt(
+            xcls_raw, ycls)
 
-            cls_scores = xcls.cpu().numpy()[
-                [i for i in range(pred.shape[0])], pred]
-            rep_scores = torch.abs(x_detach).mean(dim=1).cpu().numpy()
-            if not self.training and not prepareTest and (not isinstance(self.avg_feature, list) or self.avg_feature[0][0] != 0):
-                rep_cspt = self.get_feature_prototype_deviation(x_detach, pred)
-                if self.enable_gram:
-                    rep_gram = self.get_feature_gram_deviation(x_detach, pred)
-                else:
-                    rep_gram = np.zeros_like(cls_scores)
-            else:
-                rep_cspt = np.zeros_like(cls_scores)
-                rep_gram = np.zeros_like(cls_scores)
-            R = [cls_scores, rep_scores, rep_cspt, rep_gram, max_prob]
-
-            scores = np.stack([score_reduce(eval(self.config['score'])), score_reduce(
-                rep_cspt), score_reduce(rep_gram)], axis=1)
-            return pred, scores
-
-        if self.training:
-            # xcls is the loss value obtained from the CSSRCriterion class
-            xcls = self.crt(xcls_raw, ycls)
-            if reqpredauc:
-                pred, score = pred_score(xcls_raw.detach())
-                return xcls, pred, score
-        else:
-            xcls = xcls_raw
-            # xrot = self.rot_cls(x)
-            if reqpredauc:
-                pred, score = pred_score(xcls)
-                deviations = None
-                # powers = range(1,10)
-                if prepareTest:
-                    if not isinstance(self.avg_feature, list):
-                        self.avg_feature = [[0, 0]
-                                            for i in range(self.num_classes)]
-                        self.avg_gram = [[[0, 0] for i in range(
-                            self.num_classes)] for i in self.powers]
-                    # hdfts = self.backbone.backbone.obtain_gram_feats()
-                    # self.update_minmax(hdfts + [x] + clslatents,powers,pred)
-                    self.cal_feature_prototype(x, pred)
-                # else:
-                #     deviations = self.get_deviations(self.backbone.backbone.obtain_gram_feats() + [x]+ clslatents,powers,pred)
-                return pred, score, deviations
-
-        return xcls
+        return xcls, targets, outlinear, outdistance, (anL, tupL)
 
 
 class CSSRCriterion(nn.Module):
@@ -567,7 +520,7 @@ class CSSRCriterion(nn.Module):
         y = torch.reshape(y, [-1, 1]).long()
         return torch.zeros(y.shape[0], clsnum).cuda().scatter_(1, y, 1)
 
-    def __init__(self, avg_order, num_classes, enable_sigma=True):
+    def __init__(self, avg_order, num_classes, mapping, enable_sigma=True):
         super().__init__()
         self.avg_order = {"avg_softmax": 1, "softmax_avg": 2}[avg_order]
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
@@ -581,7 +534,6 @@ class CSSRCriterion(nn.Module):
         _, _, _, self.mapping = get_train_loaders(
             "CIFAR10", 0, self.cfg
         )
-    # TODO: Change in forward method to update the loss function from softmax to CAC distance based loss @ https://github.com/dimitymiller/cac-openset
 
     def distance_classifier(self, x):
         ''' Calculates euclidean distance from x to each class anchor
@@ -616,28 +568,25 @@ class CSSRCriterion(nn.Module):
 
     def forward(self, x, y=None, prob=False, pred=False):
 
-        g = self.avg_pool(x).view(x.shape[0], -1)
-        g = self.distance_classifier(g)
+        outlinear = self.avg_pool(x).view(x.shape[0], -1)
+        outdistance = self.distance_classifier(outlinear)
 
         if y is not None:
             targets = torch.Tensor([self.mapping[xi]
                                    for xi in y]).long().cuda()
-            cacLoss, _, _ = self.CACLoss(g, targets)
+            cacLoss, anchorL, tupletL = self.CACLoss(outdistance, targets)
 
         if prob:
-            return g
+            return outdistance
         if pred:
-            return torch.argmax(g, dim=1)
+            return torch.argmax(outdistance, dim=1)
 
-        return cacLoss
+        return cacLoss, targets, outlinear, outdistance, (anchorL, tupletL)
 
 
 def manual_contrast(x):
     s = random.uniform(0.1, 2)
     return x * s
-
-
-class WrapDataset(data.Dataset):
 
     def __init__(self, labeled_ds, config, inchan_num=3) -> None:
         super().__init__()
@@ -706,137 +655,177 @@ class WrapDataset(data.Dataset):
         return img, lb, index
 
 
+best_acc = 0
+best_cac = 10000
+best_anchor = 10000
+start_epoch = 0
+
+
 @util.regmethod('cssr')
 class CSSRMethod:
 
     def get_cfg(self, key, default):
         return self.config[key] if key in self.config else default
 
-    def __init__(self, config, clssnum, train_set) -> None:
+    def __init__(self, config, clssnum, trainloader, valloader, mapping) -> None:
         self.config = config
         self.epoch = 0
         self.lr = config['learn_rate']
         self.batch_size = config['batch_size']
 
         self.clsnum = clssnum
-        self.crt = CSSRCriterion(config['arch_type'], clssnum, False)
-        with open("datasets/config.json") as config_file:
-            cfg = json.load(config_file)["CIFAR10"]
+        self.crt = CSSRCriterion(config['arch_type'], clssnum, mapping, False)
+        # with open("datasets/config.json") as config_file:
+        #     cfg = json.load(config_file)["CIFAR10"]
 
-        self.trainloader, self.valloader, _, self.mapping = get_train_loaders(
-            "CIFAR10", 0, cfg
-        )
+        self.trainloader, self.valloader = trainloader, valloader
         # Here building the whole network. The CSSRModel class contains the build of alll
         # model with backbone and classifier and loss function
         self.model = CSSRModel(self.clsnum, config, self.crt).cuda()
         self.modelopt = torch.optim.SGD(
             self.model.parameters(), lr=self.lr, weight_decay=5e-4)
 
-        self.wrap_ds = WrapDataset(train_set, self.config, inchan_num=3,)
-        self.wrap_loader = data.DataLoader(self.wrap_ds,
-                                           batch_size=self.config['batch_size'], shuffle=True, pin_memory=True, num_workers=0)
-        self.lr_schedule = util.get_scheduler(self.config, self.wrap_loader)
+        # self.wrap_ds = WrapDataset(train_set, self.config, inchan_num=3,)
+        # self.wrap_loader = data.DataLoader(self.wrap_ds,
+        #                                    batch_size=self.config['batch_size'], shuffle=True, pin_memory=True, num_workers=0)
+        self.lr_schedule = util.get_scheduler(self.config, self.trainloader)
 
         self.prepared = -999
 
-    def train_epoch(self):
-        global cfg
-        """Trains the model using the dataloader.
-        self.wrap_loader is used as a trainloader here, and this wrap loader wraps the
-        trainloader dataset into a wrapper with various transformations.
-
-        Returns:
-            _type_: _description_
-        """
-        data_time = AverageMeter()
-        batch_time = AverageMeter()
-        train_acc = AverageMeter()
-
-        running_loss = AverageMeter()
-
+    def train_epoch(self, epoch):
+        print("\nEpoch: %d" % epoch)
         self.model.train()
+        train_loss = 0
+        correctDist = 0
+        total = 0
 
-        # TODO: code embedded dataset name just for testing
-        # TODO: remove the name and use from arguments
+        for batch_idx, (inputs, tgts) in enumerate(self.trainloader):
 
-        endtime = time.time()
-        # for i, data in enumerate(tqdm.tqdm(self.wrap_loader)):
-        for i, data in enumerate(self.trainloader):
-            data_time.update(time.time() - endtime)
-
-            self.lr = self.lr_schedule.get_lr(self.epoch, i, self.lr)
+            self.lr = self.lr_schedule.get_lr(self.epoch, batch_idx, self.lr)
             util.set_lr([self.modelopt], self.lr)
-            sx, lb = data[0].cuda(), data[1].cuda()
+            sx, lb = inputs.cuda(), tgts.cuda()
+            loss, targets, _, outdistance, _ = self.model(
+                sx, lb, reqpredauc=True)
 
-            loss, pred, scores = self.model(sx, lb, reqpredauc=True)
             self.modelopt.zero_grad()
             # This back propagation of the loss should be the loss from CAC.
-            # TODO: track thee cac loss from here and use this for backward
             loss.backward()
             self.modelopt.step()
 
-            nplb = data[1].numpy()
-            train_acc.update((pred == nplb).sum() /
-                             pred.shape[0], pred.shape[0])
-            running_loss.update(loss.item())
-            batch_time.update(time.time() - endtime)
-            endtime = time.time()
-        self.epoch += 1
-        training_res = \
-            {"Loss": running_loss.avg,
-             "TrainAcc": train_acc.avg,
-             "Learn Rate": self.lr,
-             "DataTime": data_time.avg,
-             "BatchTime": batch_time.avg}
+            # outputs = net(inputs)
+            # cacLoss, anchorLoss, tupletLoss = CACLoss(outputs[1], targets)
 
-        return training_res
+            train_loss += loss.item()
 
-    def known_prediction_test(self, test_loader):
+            _, predicted = outdistance.min(1)
+
+            total += targets.size(0)
+            correctDist += predicted.eq(targets).sum().item()
+
+            progress_bar(
+                batch_idx,
+                len(self.trainloader),
+                "Loss: %.3f | Acc: %.3f%% (%d/%d)"
+                % (
+                    train_loss / (batch_idx + 1),
+                    100.0 * correctDist / total,
+                    correctDist,
+                    total,
+                ),
+            )
+
+    def val(self, epoch, dataset_name, trial):
+        global best_acc
+        global best_anchor
+        global best_cac
         self.model.eval()
-        pred, scores, _, _ = self.scoring(test_loader)
-        return pred
-
-    def get_euclidean_distance(self):
-        return self.model.mean_latent()
-
-    def scoring(self, loader, prepare=False):
-        gts = []
-        deviations = []
-
-        scores = []
-        prediction = []
+        anchor_loss = 0
+        cac_loss = 0
+        correct = 0
+        total = 0
         with torch.no_grad():
-            for d in tqdm.tqdm(loader):
-                x1 = d[0].cuda(non_blocking=True)
-                gt = d[1].numpy()
-                pred, scr, dev = self.model(
-                    x1, reqpredauc=True, prepareTest=prepare)
+            for batch_idx, (inputs, tgts) in enumerate(self.valloader):
+                inputs = inputs.cuda()
+                tgts = tgts.cuda()
+                loss, targets, _, outdistance, (anchorLoss, tupletLoss) = self.model(
+                    inputs, tgts, reqpredauc=True)
 
-                prediction.append(pred)
-                scores.append(scr)
-                gts.append(gt)
+                # outputs = net(inputs)
+                # cacLoss, anchorLoss, tupletLoss = CACLoss(outputs[1], targets)
+                anchor_loss += anchorLoss
+                cac_loss += loss
 
-        prediction = np.concatenate(prediction)
-        scores = np.concatenate(scores)
-        gts = np.concatenate(gts)
+                _, predicted = outdistance.min(1)
 
-        return prediction, scores, deviations, gts
+                total += targets.size(0)
 
-    def knownpred_unknwonscore_test(self, test_loader):
-        self.model.eval()
-        if self.prepared != self.epoch:
-            self.wrap_ds.test_mode = True
-            tpred, tscores, _, _ = self.scoring(self.wrap_loader, True)
-            self.wrap_ds.test_mode = False
-            self.prepared = self.epoch
-        pred, scores, devs, gts = self.scoring(test_loader)
+                correct += predicted.eq(targets).sum().item()
 
-        if self.config['integrate_score'] != "S[0]":
-            tpred, tscores, _, _ = self.scoring(self.wrap_loader, False)
-            mean, std = tscores.mean(axis=0), tscores.std(axis=0)
-            scores = (scores - mean)/(std + 1e-8)
-        S = scores.T
-        return eval(self.config['integrate_score']), -9999999, pred
+                progress_bar(
+                    batch_idx,
+                    len(self.valloader),
+                    "Acc: %.3f%% (%d/%d)" % (100.0 * correct /
+                                             total, correct, total),
+                )
+
+        anchor_loss /= len(self.valloader)
+        cac_loss /= len(self.valloader)
+        acc = 100.0 * correct / total
+
+        # Save checkpoint.
+        state = {
+            "net": self.model.state_dict(),
+            "acc": acc,
+            "epoch": epoch,
+        }
+        if not os.path.isdir("networks/weights/{}".format(dataset_name)):
+            os.makedirs("networks/weights/{}".format(dataset_name))
+        if dataset_name == "CIFAR+10":
+            if not os.path.isdir("networks/weights/CIFAR+50"):
+                os.mkdir("networks/weights/CIFAR+50")
+        save_name = "{}_{}CACclassifier".format(
+            dataset_name, trial)
+        if anchor_loss <= best_anchor:
+            print("Saving..")
+            torch.save(
+                state,
+                "networks/weights/{}/".format(dataset_name) +
+                save_name + "AnchorLoss.pth",
+            )
+            best_anchor = anchor_loss
+
+            if dataset_name == "CIFAR+10":
+                save_name = save_name.replace("+10", "+50")
+                torch.save(
+                    state, "networks/weights/CIFAR+50/" + save_name + "AnchorLoss.pth"
+                )
+
+        if cac_loss <= best_cac:
+            print("Saving..")
+            torch.save(
+                state,
+                "networks/weights/{}/".format(dataset_name) +
+                save_name + "CACLoss.pth",
+            )
+            best_cac = cac_loss
+            if dataset_name == "CIFAR+10":
+                save_name = save_name.replace("+10", "+50")
+                torch.save(state, "networks/weights/CIFAR+50/" +
+                           save_name + "CACLoss.pth")
+
+        if acc >= best_acc:
+            print("Saving..")
+            torch.save(
+                state,
+                "networks/weights/{}/".format(dataset_name) +
+                save_name + "Accuracy.pth",
+            )
+            best_acc = acc
+
+            if dataset_name == "CIFAR+10":
+                save_name = save_name.replace("+10", "+50")
+                torch.save(state, "networks/weights/CIFAR+50/" +
+                           save_name + "Accuracy.pth")
 
     def save_model(self, path):
         save_dict = {
